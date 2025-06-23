@@ -1,14 +1,14 @@
 # sentiment_analysis.py
-# お客様の成功ロジックとエラー報告を反映した最終修正版です。
+# 発言者の所属政党ごとにネガポジスコアを算出し、ランキング形式で表示する機能を追加しました。
 
 import requests
 import time
 import json
 import sys
 import os
-import re # 正規表現モジュールをインポート
+import re
 from janome.tokenizer import Tokenizer
-from datetime import date, timedelta # 日付を扱うために追加
+from datetime import date, timedelta
 
 # --- 設定項目 ---
 DIC_FILE = 'pn_ja.dic.txt'
@@ -35,21 +35,17 @@ def load_sentiment_dictionary(filepath):
     print(f"辞書の読み込み完了。{len(sentiment_dic)}語を登録しました。")
     return sentiment_dic
 
-def analyze_sentiment(text, sentiment_dic):
+def analyze_sentiment_for_party(text, sentiment_dic):
     """
-    与えられたテキストのネガポジを判定します。
+    与えられたテキストのネガポジを判定します。（政党分析用）
     """
-    print("\n[ステップ 3/3] ネガポジ分析を実行します...")
     tokenizer = Tokenizer()
-    
-    # ★★★ 修正点 ★★★
-    # TypeErrorを解消するため、非対応の引数 'stream=True' を削除します。
     tokens = tokenizer.tokenize(text)
-    # ★★★ 修正ここまで ★★★
     
     score = 0
     positive_words = []
     negative_words = []
+    
     for token in tokens:
         word = token.surface
         if word in sentiment_dic:
@@ -59,13 +55,14 @@ def analyze_sentiment(text, sentiment_dic):
             elif sentiment_dic[word] == 'n':
                 score -= 1
                 negative_words.append(word)
-    return score, positive_words, negative_words
+    # 重複を除いた単語リストを返す
+    return score, list(set(positive_words)), list(set(negative_words))
 
 def main():
     """
     メイン処理
     """
-    print("--- 国会会議録ネガポジ判定プログラム (成功ロジック再現版) ---")
+    print("--- 【政党別スコア対応版】国会会議録ネガポジ判定プログラム ---")
     
     # 1. 感情辞書の読み込み
     print("\n[ステップ 1/3] 感情辞書を読み込んでいます...")
@@ -73,14 +70,9 @@ def main():
     if sentiment_dic is None:
         sys.exit()
 
-    # 2. 検索パラメータの入力 (お客様のコードのロジックを忠実に再現)
+    # 2. 検索パラメータの入力とデータ取得
     print("\n[ステップ 2/3] 検索条件を指定してデータを取得します...")
-    
-    # ★★★ 修正点 ★★★
-    # お客様のご報告に基づき、動作実績のあるURLに修正します。
     base_url = "https://kokkai.ndl.go.jp/api/speech"
-    # ★★★ 修正ここまで ★★★
-    
     params = {}
 
     any_keyword = input('検索キーワードを入力してください (必須) >> ')
@@ -88,10 +80,6 @@ def main():
         print("キーワードは必須です。プログラムを終了します。")
         sys.exit()
     params['any'] = any_keyword
-
-    speaker = input('発言者名を入力してください (Enterでスキップ) >> ')
-    if speaker:
-        params['speaker'] = speaker
 
     from_input = input('検索開始日を入力 (YYYY-MM-DD, Enterで1年前) >> ')
     if from_input and re.match(r'^\d{4}-\d{2}-\d{2}$', from_input):
@@ -109,7 +97,7 @@ def main():
         params['until'] = today
         print(f"  - 終了日が不正または未入力のため、本日に設定: {today}")
 
-    # ヒット件数確認用のリクエスト
+    # ヒット件数確認
     params_count = params.copy()
     params_count['maximumRecords'] = 1
     params_count['recordPacking'] = "json"
@@ -118,23 +106,23 @@ def main():
         print("  - ヒット件数をサーバーに問い合わせています...")
         response_count = requests.get(base_url, params=params_count)
         response_count.raise_for_status()
-        json_data_count = response_count.json()
-        total_num = json_data_count.get("numberOfRecords", 0)
+        total_num = response_count.json().get("numberOfRecords", 0)
     except Exception as e:
         print(f"APIへのリクエスト中にエラーが発生しました: {e}")
         sys.exit()
     
     if int(total_num) == 0:
-        print("検索結果は0件でした。プログラムを終了します。")
+        print("検索結果は0件でした。")
         sys.exit()
 
-    # キャンセルオプション
-    next_input = input(f"検索結果は {total_num} 件です。分析しますか？\n(キャンセルする場合は 'n' を入力) >> ")
+    next_input = input(f"検索結果は {total_num} 件です。分析しますか？ (キャンセルする場合は 'n' を入力) >> ")
     if next_input.lower() == "n":
         print('プログラムをキャンセルしました')
         sys.exit()
     
-    # 全件取得
+    # 全件取得と政党ごとのデータ分類
+    party_speeches = {} # { '政党名': '発言1 発言2 ...', ... } という形式の辞書
+    
     max_records_per_request = 100
     if int(total_num) > 30000:
         print("  - 注意: 検索結果が30000件を超えています。最新の30000件を分析対象とします。")
@@ -142,7 +130,6 @@ def main():
     
     pages = (int(total_num) + max_records_per_request - 1) // max_records_per_request
     
-    all_speech_text = ""
     params_data = params.copy()
     params_data['maximumRecords'] = max_records_per_request
     params_data['recordPacking'] = "json"
@@ -155,12 +142,17 @@ def main():
             
             records = response_data.json().get('speechRecord', [])
             for record in records:
-                all_speech_text += record.get('speech', '') + "\n"
+                # 'speakerGroup'がない場合は「所属なし」とする
+                party_name = record.get('speakerGroup', '所属なし')
+                speech_text = record.get('speech', '')
+                
+                if party_name not in party_speeches:
+                    party_speeches[party_name] = "" # 辞書に新しい政党を追加
+                party_speeches[party_name] += speech_text + "\n"
             
             sys.stdout.write(f"\r  - データを取得中... {i + 1}/{pages} ページ完了")
             sys.stdout.flush()
             
-            # ★重要なインターバル
             time.sleep(1)
 
         except Exception as e:
@@ -169,42 +161,33 @@ def main():
     
     print("\nすべてのデータ取得が完了しました。")
 
-    if not all_speech_text:
-        print("分析対象の発言が取得できませんでした。プログラムを終了します。")
-        sys.exit()
-
-    # 3. ネガポジ分析
-    score, positive_words, negative_words = analyze_sentiment(all_speech_text, sentiment_dic)
+    # 3. 政党ごとにネガポジ分析を実行
+    print("\n[ステップ 3/3] 政党ごとのネガポジ分析を実行します...")
+    analysis_results = []
+    for party, speeches in party_speeches.items():
+        score, pos_words, neg_words = analyze_sentiment_for_party(speeches, sentiment_dic)
+        # 発言がない政党は結果に追加しない
+        if pos_words or neg_words:
+            analysis_results.append({
+                'party': party,
+                'score': score,
+                'positive_words': pos_words,
+                'negative_words': neg_words
+            })
+    
+    # スコアの高い順に並び替え
+    sorted_results = sorted(analysis_results, key=lambda x: x['score'], reverse=True)
     
     # 4. 結果表示
-    print("\n--- 分析結果 ---")
-    print(f"検索キーワード: '{params.get('any')}'")
-    if params.get('speaker'):
-        print(f"発言者名: '{params.get('speaker')}'")
-    print(f"検索期間: {params.get('from')} ~ {params.get('until')}")
-    print(f"分析対象の発言数: {total_num} 件")
-    print(f"総合スコア: {score}")
+    print("\n--- 政党別 分析結果 (スコア順) ---")
     
-    if score > 0:
-        print("判定: ポジティブな内容の可能性が高いです。")
-    elif score < 0:
-        print("判定: ネガティブな内容の可能性が高いです。")
-    else:
-        print("判定: 中立的な内容、またはポジティブとネガティブが均衡しています。")
-
-    print("\n検出されたポジティブ単語 (上位20種):")
-    if positive_words:
-        print(f"  {list(set(positive_words))[:20]}")
-    else:
-        print("  (なし)")
-        
-    print("\n検出されたネガティブ単語 (上位20種):")
-    if negative_words:
-        print(f"  {list(set(negative_words))[:20]}")
-    else:
-        print("  (なし)")
+    for result in sorted_results:
+        print(f"\n【{result['party']}】")
+        print(f"  スコア: {result['score']}")
+        print(f"  ポジティブ単語: {result['positive_words'][:10]}") # 上位10単語を表示
+        print(f"  ネガティブ単語: {result['negative_words'][:10]}") # 上位10単語を表示
     
-    print("\n--- プログラム終了 ---")
+    print("\n\n--- プログラム終了 ---")
 
 if __name__ == '__main__':
     main()
